@@ -1,6 +1,6 @@
 # KinderPlanet Varle catalogue automation
 
-This repository refreshes the public Varle XML every hour from the KinderPlanet
+This repository refreshes the public Varle XML every 30 minutes from the KinderPlanet
 Verskis full export. It changes only validated `price` and `quantity` fields.
 
 ## Stable catalogue address

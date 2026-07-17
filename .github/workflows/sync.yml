@@ -1,0 +1,88 @@
+name: Update Varle XML
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: varle-feed-update
+  cancel-in-progress: false
+
+jobs:
+  update-feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_XML_URL: https://www.kinderplanet.lt/userfiles/imex/verskis_xml/export/A_A_3f6de1fdd8d81e162850b9cd040a0c14-full.xml
+
+    steps:
+      - name: Load automation
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test safety rules
+        run: python -m unittest discover -s tests -v
+
+      - name: Download current published feed
+        shell: bash
+        run: |
+          mkdir -p run
+          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
+          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern varle.xml --dir run
+          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern state.json --dir run || true
+
+      - name: Build and validate updated feed
+        run: |
+          python sync_varle.py \
+            --source "$SOURCE_XML_URL" \
+            --main run/varle.xml \
+            --output run/candidate.xml \
+            --state run/state.json \
+            --report run/report.json
+
+      - name: Publish without changing the public link
+        shell: bash
+        run: |
+          new_tag="feed-$(date -u +%Y%m%d-%H%M%S)"
+          gh release create "$new_tag" \
+            "run/candidate.xml#varle.xml" \
+            "run/state.json#state.json" \
+            "run/report.json#report.json" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Validated catalogue $(date -u '+%Y-%m-%d %H:%M UTC')" \
+            --notes "Automatically validated KinderPlanet catalogue feed." \
+            --latest
+
+      - name: Keep the latest eight recovery versions
+        shell: bash
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[8:] | .[].tagName' |
+          while read -r old_tag; do
+            [ -z "$old_tag" ] || gh release delete "$old_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
+
+      - name: Prevent scheduled-workflow inactivity shutdown
+        if: ${{ github.event_name == 'schedule' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ "$(date -u +%d-%H)" = "01-03" ]; then
+            git config user.name "kinderplanet-automation"
+            git config user.email "actions@users.noreply.github.com"
+            date -u +%Y-%m-%dT%H:%M:%SZ > .github/automation-heartbeat.txt
+            git add .github/automation-heartbeat.txt
+            git commit -m "Keep hourly automation active"
+            git pull --rebase
+            git push
+          fi

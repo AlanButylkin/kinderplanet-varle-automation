@@ -36,8 +36,18 @@ jobs:
         shell: bash
         run: |
           mkdir -p run
-          current_tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)"
-          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern varle.xml --dir run
+          current_tag=""
+          while read -r candidate_tag; do
+            rm -f run/varle.xml
+            if gh release download "$candidate_tag" --repo "$GITHUB_REPOSITORY" --pattern varle.xml --dir run 2>/dev/null; then
+              current_tag="$candidate_tag"
+              break
+            fi
+          done < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
+          if [ -z "$current_tag" ]; then
+            echo "No valid release containing varle.xml was found."
+            exit 1
+          fi
           gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern state.json --dir run || true
 
       - name: Build and validate updated feed
@@ -52,11 +62,12 @@ jobs:
       - name: Publish without changing the public link
         shell: bash
         run: |
+          cp run/candidate.xml run/varle.xml
           new_tag="feed-$(date -u +%Y%m%d-%H%M%S)"
           gh release create "$new_tag" \
-            "run/candidate.xml#varle.xml" \
-            "run/state.json#state.json" \
-            "run/report.json#report.json" \
+            run/varle.xml \
+            run/state.json \
+            run/report.json \
             --repo "$GITHUB_REPOSITORY" \
             --title "Validated catalogue $(date -u '+%Y-%m-%d %H:%M UTC')" \
             --notes "Automatically validated KinderPlanet catalogue feed." \

@@ -59,6 +59,7 @@ class SyncTests(unittest.TestCase):
         self.assertIn("<id>A</id><title><![CDATA[Keep <b>exactly</b>]]></title><price>12.1</price><quantity>3</quantity>", candidate)
         self.assertEqual(result["price_changes"], 1)
         self.assertEqual(result["quantity_changes"], 1)
+        self.assertEqual(result["source_only_products"], 0)
 
     def test_missing_requires_two_runs_and_duplicate_is_untouched(self):
         temp1, root1, first, _ = self.run_sync()

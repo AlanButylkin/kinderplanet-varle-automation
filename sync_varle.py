@@ -198,6 +198,7 @@ def synchronize(
 
     matched_count = sum(code in unique_source for code in main_ids)
     match_rate = matched_count / len(main_ids)
+    source_only_codes = sorted(set(unique_source) - set(main_ids))
     if match_rate < minimum_match_rate:
         raise RuntimeError(
             f"Source match rate {match_rate:.3%} is below the required {minimum_match_rate:.3%}"
@@ -296,6 +297,7 @@ def synchronize(
         "main_products": len(main_ids),
         "matched_unique_source": matched_count,
         "match_rate": round(match_rate, 6),
+        "source_only_products": len(source_only_codes),
         "missing_from_source": len(missing_codes),
         "duplicate_source_codes_in_main": len(duplicate_codes_in_main),
         "missing_source_price": len(missing_source_price),
@@ -315,6 +317,7 @@ def synchronize(
             "duplicate_source_codes": duplicate_codes_in_main[:50],
             "missing_source_price": missing_source_price[:50],
             "missing_source_quantity": missing_source_quantity[:50],
+            "source_only_codes": source_only_codes[:100],
         },
         "publish_allowed": True,
     }

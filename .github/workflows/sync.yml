@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   group: varle-feed-update
@@ -59,6 +61,20 @@ jobs:
             --state run/state.json \
             --report run/report.json
 
+      - name: Prepare GitHub Pages XML
+        shell: bash
+        run: |
+          mkdir -p run/pages
+          cp run/candidate.xml run/pages/varle.xml
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: run/pages
+
       - name: Publish without changing the public link
         shell: bash
         run: |
@@ -97,3 +113,20 @@ jobs:
             git pull --rebase
             git push
           fi
+
+  deploy-pages:
+    needs: update-feed
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy XML to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

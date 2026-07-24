@@ -51,15 +51,60 @@ jobs:
             exit 1
           fi
           gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern state.json --dir run || true
+          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern catalog-state.json.gz --dir run || true
+
+      - name: Download Verskis catalogue once
+        shell: bash
+        run: |
+          curl --fail --location \
+            --retry 3 \
+            --retry-delay 5 \
+            --connect-timeout 30 \
+            --max-time 240 \
+            "$SOURCE_XML_URL" \
+            --output run/source.xml
 
       - name: Build and validate updated feed
         run: |
           python sync_varle.py \
-            --source "$SOURCE_XML_URL" \
+            --source run/source.xml \
             --main run/varle.xml \
             --output run/candidate.xml \
             --state run/state.json \
             --report run/report.json
+
+      - name: Track catalogue additions removals and field changes
+        run: |
+          python catalog_tracker.py \
+            --source run/source.xml \
+            --varle run/candidate.xml \
+            --previous-state run/catalog-state.json.gz \
+            --output-state run/catalog-state.json.gz \
+            --report run/catalog-report.json \
+            --current-csv run/catalog-current.csv \
+            --events-csv run/catalog-events.csv \
+            --latest-changes-csv run/catalog-latest-changes.csv \
+            --new-products-csv run/new-products.csv \
+            --removed-products-csv run/removed-products.csv \
+            --not-in-varle-csv run/not-in-varle.csv \
+            --workbook run/catalog-latest.xlsx
+          gzip -9 -c run/catalog-current.csv > run/catalog-current.csv.gz
+          gzip -9 -c run/catalog-events.csv > run/catalog-events.csv.gz
+
+      - name: Add catalogue summary
+        shell: bash
+        run: |
+          {
+            echo "## Catalogue inspection"
+            echo
+            echo "- Tracked records: $(jq -r .tracked_records run/catalog-report.json)"
+            echo "- New products: $(jq -r .added_products run/catalog-report.json)"
+            echo "- Removed products: $(jq -r .removed_products run/catalog-report.json)"
+            echo "- Restored products: $(jq -r .restored_products run/catalog-report.json)"
+            echo "- Field changes: $(jq -r .field_changes run/catalog-report.json)"
+            echo "- Source products not in Varle: $(jq -r .not_in_varle run/catalog-report.json)"
+            echo "- Duplicate source codes: $(jq -r .source_duplicate_codes run/catalog-report.json)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Prepare GitHub Pages XML
         shell: bash
@@ -84,17 +129,44 @@ jobs:
             run/varle.xml \
             run/state.json \
             run/report.json \
+            run/catalog-state.json.gz \
+            run/catalog-report.json \
+            run/catalog-latest.xlsx \
+            run/catalog-current.csv.gz \
+            run/catalog-events.csv.gz \
+            run/catalog-latest-changes.csv \
+            run/new-products.csv \
+            run/removed-products.csv \
+            run/not-in-varle.csv \
             --repo "$GITHUB_REPOSITORY" \
             --title "Validated catalogue $(date -u '+%Y-%m-%d %H:%M UTC')" \
-            --notes "Automatically validated KinderPlanet catalogue feed." \
+            --notes "Automatically validated feed plus a full catalogue workbook and change history." \
             --latest
+
+      - name: Keep one autonomous monthly workbook
+        shell: bash
+        run: |
+          if [ "$(date -u +%d)" = "01" ]; then
+            month="$(date -u +%Y-%m)"
+            monthly_tag="catalog-monthly-$month"
+            if ! gh release view "$monthly_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              cp run/catalog-latest.xlsx "run/catalog-$month.xlsx"
+              cp run/catalog-events.csv.gz "run/catalog-events-$month.csv.gz"
+              gh release create "$monthly_tag" \
+                "run/catalog-$month.xlsx" \
+                "run/catalog-events-$month.csv.gz" \
+                --repo "$GITHUB_REPOSITORY" \
+                --title "Catalogue snapshot $month" \
+                --notes "Autonomous monthly catalogue snapshot. Monthly snapshots are not removed by feed cleanup."
+            fi
+          fi
 
       - name: Keep the latest eight recovery versions
         shell: bash
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
             --json tagName,publishedAt \
-            --jq 'sort_by(.publishedAt) | reverse | .[8:] | .[].tagName' |
+            --jq 'map(select(.tagName | startswith("feed-"))) | sort_by(.publishedAt) | reverse | .[8:] | .[].tagName' |
           while read -r old_tag; do
             [ -z "$old_tag" ] || gh release delete "$old_tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           done

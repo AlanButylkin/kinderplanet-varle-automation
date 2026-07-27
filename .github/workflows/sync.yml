@@ -21,6 +21,9 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_XML_URL: https://www.kinderplanet.lt/userfiles/imex/verskis_xml/export/A_A_3f6de1fdd8d81e162850b9cd040a0c14-full.xml
+      # Emergency shutdown: keep the public XML live, but publish every quantity as 0.
+      # Change to "false" only when normal price/stock synchronization should resume.
+      EMERGENCY_ZERO_STOCK: "true"
 
     steps:
       - name: Load automation
@@ -65,13 +68,23 @@ jobs:
             --output run/source.xml
 
       - name: Build and validate updated feed
+        shell: bash
         run: |
-          python sync_varle.py \
-            --source run/source.xml \
-            --main run/varle.xml \
-            --output run/candidate.xml \
-            --state run/state.json \
-            --report run/report.json
+          if [ "$EMERGENCY_ZERO_STOCK" = "true" ]; then
+            python zero_stock.py \
+              --main run/varle.xml \
+              --output run/candidate.xml \
+              --state run/state.json \
+              --report run/report.json
+            echo "## EMERGENCY MODE: all published quantities are zero" >> "$GITHUB_STEP_SUMMARY"
+          else
+            python sync_varle.py \
+              --source run/source.xml \
+              --main run/varle.xml \
+              --output run/candidate.xml \
+              --state run/state.json \
+              --report run/report.json
+          fi
 
       - name: Track catalogue additions removals and field changes
         run: |

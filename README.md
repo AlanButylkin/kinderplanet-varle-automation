@@ -1,5 +1,11 @@
 # KinderPlanet Varle catalogue automation
 
+> **Current operating mode:** emergency zero stock. The permanent XML remains
+> available, but every published product quantity is forced to `0` on every
+> scheduled run. Normal synchronization resumes only after
+> `EMERGENCY_ZERO_STOCK` in `.github/workflows/sync.yml` is explicitly changed
+> to `"false"`.
+
 [![Update Varle XML](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml/badge.svg)](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml)
 
 This repository refreshes the public Varle XML every 30 minutes from the

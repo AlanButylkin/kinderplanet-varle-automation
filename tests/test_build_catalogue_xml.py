@@ -1,62 +1,64 @@
-import json
-import tempfile
 import unittest
-import xml.etree.ElementTree as ET
-from pathlib import Path
 
 from build_catalogue_xml import (
-    WorkbookRule,
+    cdata,
+    product_attributes,
     select_barcode,
-    transform_xml,
     valid_gtin,
 )
 
 
 class BuildCatalogueXmlTests(unittest.TestCase):
-    def test_barcode_priority(self) -> None:
+    def test_barcode_priority_and_validation(self) -> None:
         self.assertEqual(
-            select_barcode("1111111111111", "2222222222222", "3333333333333"),
-            ("1111111111111", "ean"),
+            select_barcode("4250341315820", "2222222222222", "4250341315813"),
+            ("4250341315820", "ean"),
         )
         self.assertEqual(
-            select_barcode("", "2222222222222", "3333333333333"),
-            ("3333333333333", "ean3_from_ean2"),
+            select_barcode("", "source-ean2", "4250341315813"),
+            ("4250341315813", "ean3_from_ean2"),
         )
         self.assertEqual(
-            select_barcode("", "", "3333333333333"),
-            ("3333333333333", "ean3"),
+            select_barcode("", "", "4250341315813"),
+            ("4250341315813", "ean3"),
         )
+        self.assertEqual(select_barcode("", "source-ean2", ""), ("", "blank"))
         self.assertTrue(valid_gtin("4250341315820"))
         self.assertFalse(valid_gtin("4250341315821"))
 
-    def test_replaces_barcodes_and_omits_ineligible_rows(self) -> None:
-        source = """<?xml version="1.0" encoding="UTF-8"?>
-<root><products>
-<product><id>A</id><title><![CDATA[Vežimėlis]]></title><barcode_format></barcode_format><barcode></barcode></product>
-<product><id>B</id><title><![CDATA[Keep bytes]]></title><barcode_format>EAN</barcode_format><barcode>old</barcode></product>
-</products></root>
-"""
-        rules = {
-            "A": WorkbookRule("A", "4250341315820", "ean3_from_ean2", True, ()),
-            "B": WorkbookRule("B", "4250341315813", "ean", False, ("blank_price",)),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            source_path = root / "source.xml"
-            output_path = root / "output.xml"
-            report_path = root / "report.json"
-            source_path.write_text(source, encoding="utf-8")
+    def test_all_remaining_fields_become_attributes_but_eans_do_not(self) -> None:
+        attributes = product_attributes(
+            {
+                "product_code": "A",
+                "link": "https://example.test/a",
+                "ean": "",
+                "ean2": "source-only",
+                "ean3": "4250341315820",
+                "category_path_LT": "Vežimėliai",
+                "name_LT": "Testas",
+                "description_LT": "<p>Aprašymas</p>",
+                "price_EUR_incl_vat": 10,
+                "quantity": 2,
+                "image_1": "https://example.test/a.jpg",
+                "Gamintojas": "KinderPlanet",
+                "color": "Mėlyna",
+                "tax_pct": 21,
+                "width": 30,
+            }
+        )
+        by_column = {column: (title, value) for column, title, value in attributes}
+        self.assertNotIn("ean", by_column)
+        self.assertNotIn("ean2", by_column)
+        self.assertNotIn("ean3", by_column)
+        self.assertNotIn("image_1", by_column)
+        self.assertEqual(by_column["Gamintojas"], ("Gamintojas", "KinderPlanet"))
+        self.assertEqual(by_column["color"], ("Spalva", "Mėlyna"))
+        self.assertEqual(by_column["tax_pct"], ("PVM, %", "21"))
+        self.assertEqual(by_column["width"], ("Plotis", "30"))
 
-            report = transform_xml(
-                source_path, output_path, rules, report_path, {"expected_products": 1}
-            )
+    def test_cdata_safely_splits_closing_marker(self) -> None:
+        self.assertEqual(cdata("a]]>b"), "<![CDATA[a]]]]><![CDATA[>b]]>")
 
-            xml_root = ET.parse(output_path).getroot()
-            products = xml_root.findall("./products/product")
-            self.assertEqual(len(products), 1)
-            self.assertEqual(products[0].findtext("id"), "A")
-            self.assertEqual(products[0].findtext("barcode"), "4250341315820")
-            self.assertEqual(products[0].findtext("barcode_format"), "EAN")
-            self.assertIn("<![CDATA[Vežimėlis]]>", output_path.read_text("utf-8"))
-            self.assertEqual(report["excluded_products"], 1)
-            self.assertTrue(json.loads(report_path.read_text("utf-8"))["valid"])
+
+if __name__ == "__main__":
+    unittest.main()

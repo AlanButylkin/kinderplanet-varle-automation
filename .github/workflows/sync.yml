@@ -37,24 +37,17 @@ jobs:
       - name: Test safety rules
         run: python -m unittest discover -s tests -v
 
-      - name: Download current published feed
+      - name: Load complete workbook catalogue
         shell: bash
         run: |
           mkdir -p run
-          current_tag=""
-          while read -r candidate_tag; do
-            rm -f run/varle.xml
-            if gh release download "$candidate_tag" --repo "$GITHUB_REPOSITORY" --pattern varle.xml --dir run 2>/dev/null; then
-              current_tag="$candidate_tag"
-              break
-            fi
-          done < <(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,publishedAt --jq 'sort_by(.publishedAt) | reverse | .[].tagName')
-          if [ -z "$current_tag" ]; then
-            echo "No valid release containing varle.xml was found."
-            exit 1
+          test -s catalogue/varle.xml
+          cp catalogue/varle.xml run/varle.xml
+          latest_tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // empty')"
+          if [ -n "$latest_tag" ]; then
+            gh release download "$latest_tag" --repo "$GITHUB_REPOSITORY" --pattern state.json --dir run || true
+            gh release download "$latest_tag" --repo "$GITHUB_REPOSITORY" --pattern catalog-state.json.gz --dir run || true
           fi
-          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern state.json --dir run || true
-          gh release download "$current_tag" --repo "$GITHUB_REPOSITORY" --pattern catalog-state.json.gz --dir run || true
 
       - name: Download Verskis catalogue once
         shell: bash

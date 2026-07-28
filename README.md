@@ -8,10 +8,18 @@
 
 [![Update Varle XML](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml/badge.svg)](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml)
 
-This repository refreshes the public Varle XML every 30 minutes from the
-KinderPlanet Verskis full export. It changes only validated `price` and
-`quantity` fields in the Varle feed. It also maintains an autonomous catalogue
-history and Excel workbook for inspection.
+The static catalogue baseline in `catalogue/varle.xml` is generated from the
+completed XLSX workbook. Every non-empty workbook field is represented in the
+XML: Varle-defined fields use their dedicated nodes and all remaining fields
+are emitted as product attributes. The only source columns intentionally not
+exported as attributes are `ean`, `ean2`, and `ean3`: `ean` is used as the
+barcode when present, otherwise `ean3` is used, while `ean2` is never
+published.
+
+Every 30 minutes the workflow starts from that complete baseline and changes
+only validated `price` and `quantity` values from the KinderPlanet Verskis full
+export. It also maintains an autonomous catalogue history and Excel workbook
+for inspection.
 
 ## Stable catalogue address
 
@@ -42,6 +50,11 @@ Monthly releases are excluded from the eight-version feed cleanup.
 
 ## Safety behaviour
 
+- The complete XLSX-to-XML export is checked field by field before publication.
+- Rows with a blank title, description, price, quantity, category, barcode, or
+  without an image are excluded because Varle requires those fields.
+- Barcodes must be valid, unique GTIN values.
+- `ean`, `ean2`, and `ean3` never appear as product attributes.
 - XML is validated before and after every update.
 - At least 95% of catalogue IDs must match a unique source code.
 - Duplicate source codes are reported and left unchanged.

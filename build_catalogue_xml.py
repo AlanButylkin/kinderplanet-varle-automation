@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Apply workbook barcode and required-field rules to a generated Varle XML.
+"""Build a complete VARLE Marketplace XML catalogue from the XLSX workbook.
 
-The established Excel exporter remains responsible for the XML field mapping.
-This finishing step:
+Every non-empty workbook value is represented in the XML:
 
-* keeps ``ean`` when it exists;
-* otherwise puts ``ean3`` in the XML barcode slot (including rows where
-  ``ean3`` was researched from ``ean2``);
-* omits rows with blank price, blank quantity, or no actual image URL.
+* VARLE-defined fields use their dedicated XML nodes.
+* Product parameters and remaining source fields use ``<attributes>``.
+* ``ean`` is the preferred barcode; otherwise ``ean3`` is used.
+* ``ean2`` is research input only and is never exported.
+* ``ean``, ``ean2`` and ``ean3`` are never duplicated as attributes.
+* Rows with a blank price, blank quantity, or no image are omitted.
 
-All retained XML content outside ``barcode_format`` and ``barcode`` is copied
-byte-for-byte from the established export.
+The output follows VARLE's recommended structure without a category tree.
 """
 
 from __future__ import annotations
@@ -23,30 +23,101 @@ import re
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
-PRODUCT_BLOCK_RE = re.compile(r"<product>(?P<body>.*?)</product>", re.DOTALL)
-ID_RE = re.compile(r"<id>(?P<value>.*?)</id>", re.DOTALL)
-BARCODE_FORMAT_RE = re.compile(
-    r"(<barcode_format>)(?P<value>.*?)(</barcode_format>)", re.DOTALL
-)
-BARCODE_RE = re.compile(r"(<barcode>)(?P<value>.*?)(</barcode>)", re.DOTALL)
+DELIVERY_TEXT = "2-3 d. d."
 IMAGE_HEADER_RE = re.compile(r"image_\d+")
+BARCODE_HEADERS = {"ean", "ean2", "ean3"}
+CORE_HEADERS = {
+    "product_code",
+    "link",
+    "category_path_LT",
+    "name_LT",
+    "description_LT",
+    "price_EUR_incl_vat",
+    "quantity",
+    "weight_kg",
+    "parent_code",
+    *BARCODE_HEADERS,
+}
+ATTRIBUTE_TITLE_OVERRIDES = {
+    "tax_pct": "PVM, %",
+    "prime_cost_EUR": "Savikaina, EUR",
+    "price_EUR_excl_vat": "Kaina be PVM, EUR",
+    "old_price_EUR_excl_vat": "Sena kaina be PVM, EUR",
+    "quantity_unit": "Kiekio vienetas",
+    "has_options": "Turi variantų",
+    "options_attribute_names": "Variantų atributai",
+    "image_count": "Nuotraukų skaičius",
+    "width": "Plotis",
+    "height": "Aukštis",
+    "length": "Ilgis",
+    "color": "Spalva",
+    "attr_manufacturer": "Gamintojas",
+    "attr_brand": "Prekės ženklas",
+    "attr_model_name": "Modelio pavadinimas",
+}
+MANUFACTURER_HEADERS = ("Gamintojas", "attr_manufacturer", "Prekės ženklas", "attr_brand")
+MODEL_HEADERS = ("Modelio pavadinimas", "attr_model_name")
 
 
 @dataclass(frozen=True)
-class WorkbookRule:
-    product_id: str
+class ProductRecord:
+    sheet: str
+    row: int
+    data: dict[str, Any]
+    category: str
     barcode: str
     barcode_source: str
+    images: tuple[str, ...]
+    attributes: tuple[tuple[str, str, str], ...]
     include: bool
     exclusion_reasons: tuple[str, ...]
 
+    @property
+    def product_id(self) -> str:
+        return clean(self.data.get("product_code"))
+
 
 def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "Taip" if value else "Ne"
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", text)
+
+
+def xml_escape(value: Any) -> str:
+    return (
+        clean(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def cdata(value: Any) -> str:
+    return "<![CDATA[" + clean(value).replace("]]>", "]]]]><![CDATA[>") + "]]>"
+
+
+def format_decimal(value: Any) -> str:
+    text = clean(value)
+    if not text:
+        return ""
+    try:
+        number = Decimal(text.replace(",", "."))
+    except InvalidOperation:
+        return text
+    rendered = format(number.normalize(), "f")
+    if "." in rendered:
+        rendered = rendered.rstrip("0").rstrip(".")
+    return rendered or "0"
 
 
 def select_barcode(ean: Any, ean2: Any, ean3: Any) -> tuple[str, str]:
@@ -59,214 +130,300 @@ def select_barcode(ean: Any, ean2: Any, ean3: Any) -> tuple[str, str]:
     return "", "blank"
 
 
-def load_workbook_rules(path: Path) -> tuple[dict[str, WorkbookRule], dict[str, Any]]:
-    # Kept local to this function so GitHub's stdlib-only test job can import
-    # and test the XML transformation without installing spreadsheet packages.
+def valid_gtin(value: str) -> bool:
+    if not value.isdigit() or len(value) not in (8, 12, 13, 14):
+        return False
+    digits = [int(character) for character in value]
+    weighted_sum = sum(
+        digit * (3 if index % 2 == 0 else 1)
+        for index, digit in enumerate(digits[-2::-1])
+    )
+    return (10 - weighted_sum % 10) % 10 == digits[-1]
+
+
+def first_value(data: dict[str, Any], headers: Iterable[str]) -> str:
+    for header in headers:
+        value = clean(data.get(header))
+        if value:
+            return value
+    return ""
+
+
+def category_fallback(source_category: str) -> str:
+    return re.sub(r"\s*/\s*", " -> ", clean(source_category))
+
+
+def read_category_map(workbook: Any) -> dict[str, str]:
+    if "xml" not in workbook.sheetnames:
+        return {}
+    worksheet = workbook["xml"]
+    rows = list(worksheet.iter_rows(values_only=True))
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if row and clean(row[0]) == "Source category_path_LT"
+        ),
+        None,
+    )
+    if header_index is None:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for row in rows[header_index + 1 :]:
+        source = clean(row[0] if len(row) > 0 else None)
+        count = clean(row[1] if len(row) > 1 else None)
+        target = clean(row[3] if len(row) > 3 else None)
+        if not source or not count.replace(".", "", 1).isdigit():
+            break
+        if not target or target.lower().startswith("manual review"):
+            target = category_fallback(source)
+        mapping[source] = target
+    return mapping
+
+
+def attribute_title(column: str) -> str:
+    if column in ATTRIBUTE_TITLE_OVERRIDES:
+        return ATTRIBUTE_TITLE_OVERRIDES[column]
+    if column.startswith("attr_"):
+        return column[5:].replace("_", " ").title()
+    return column
+
+
+def product_attributes(data: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
+    """Return (source column, VARLE title, value) for every remaining field."""
+    attributes: list[tuple[str, str, str]] = []
+    for column, raw_value in data.items():
+        value = clean(raw_value)
+        if not value:
+            continue
+        if column in CORE_HEADERS or IMAGE_HEADER_RE.fullmatch(column):
+            continue
+        attributes.append((column, attribute_title(column), value))
+
+    # Manufacturer/brand/model are valid product parameters as well as useful
+    # top-level VARLE nodes, so keep their original workbook values here.
+    for column in (*MANUFACTURER_HEADERS, *MODEL_HEADERS):
+        value = clean(data.get(column))
+        candidate = (column, attribute_title(column), value)
+        if value and candidate not in attributes:
+            attributes.append(candidate)
+    return tuple(attributes)
+
+
+def load_workbook_records(path: Path) -> tuple[list[ProductRecord], dict[str, Any]]:
     from openpyxl import load_workbook
 
     workbook = load_workbook(path, read_only=True, data_only=True)
-    rules: dict[str, WorkbookRule] = {}
-    duplicate_ids: dict[str, int] = {}
+    category_map = read_category_map(workbook)
+    records: list[ProductRecord] = []
+    sheet_rows: Counter[str] = Counter()
     barcode_sources: Counter[str] = Counter()
     exclusion_reasons: Counter[str] = Counter()
-    source_rows = 0
+    input_nonempty_cells = 0
+    represented_cells = 0
 
     for worksheet in workbook.worksheets:
         if worksheet.title == "xml":
             continue
         rows = worksheet.iter_rows(values_only=True)
         headers = [clean(value) for value in next(rows)]
-        indexes = {header: index for index, header in enumerate(headers) if header}
-        image_headers = [
-            header for header in headers if IMAGE_HEADER_RE.fullmatch(header)
-        ]
+        if "product_code" not in headers:
+            raise RuntimeError(f"{worksheet.title} has no product_code column")
+        image_headers = [header for header in headers if IMAGE_HEADER_RE.fullmatch(header)]
 
-        def get(row: tuple[Any, ...], header: str) -> str:
-            index = indexes.get(header)
-            if index is None or index >= len(row):
-                return ""
-            return clean(row[index])
-
-        for row in rows:
+        for row_number, row in enumerate(rows, start=2):
             if not any(clean(value) for value in row):
                 continue
-            source_rows += 1
-            product_id = get(row, "product_code")
+            data = {
+                header: row[index] if index < len(row) else None
+                for index, header in enumerate(headers)
+                if header
+            }
+            sheet_rows[worksheet.title] += 1
+            source_category = clean(data.get("category_path_LT"))
+            category = category_map.get(source_category, category_fallback(source_category))
             barcode, barcode_source = select_barcode(
-                get(row, "ean"), get(row, "ean2"), get(row, "ean3")
+                data.get("ean"), data.get("ean2"), data.get("ean3")
+            )
+            images = tuple(
+                clean(data.get(header)) for header in image_headers if clean(data.get(header))
             )
             reasons: list[str] = []
-            if not get(row, "price_EUR_incl_vat"):
+            if not clean(data.get("name_LT")):
+                reasons.append("blank_title")
+            if not clean(data.get("description_LT")):
+                reasons.append("blank_description")
+            if not category:
+                reasons.append("blank_category")
+            if not clean(data.get("price_EUR_incl_vat")):
                 reasons.append("blank_price")
-            if not get(row, "quantity"):
+            if not clean(data.get("quantity")):
                 reasons.append("blank_quantity")
-            if not any(get(row, header) for header in image_headers):
+            if not images:
                 reasons.append("no_images")
+            if not barcode:
+                reasons.append("blank_barcode")
 
-            if product_id in rules:
-                duplicate_ids[product_id] = duplicate_ids.get(product_id, 1) + 1
-            rules[product_id] = WorkbookRule(
-                product_id=product_id,
+            attributes = product_attributes(data)
+            record = ProductRecord(
+                sheet=worksheet.title,
+                row=row_number,
+                data=data,
+                category=category,
                 barcode=barcode,
                 barcode_source=barcode_source,
+                images=images,
+                attributes=attributes,
                 include=not reasons,
                 exclusion_reasons=tuple(reasons),
             )
+            records.append(record)
             barcode_sources[barcode_source] += 1
             exclusion_reasons.update(reasons)
 
-    if duplicate_ids:
-        raise RuntimeError(f"Workbook contains duplicate product IDs: {duplicate_ids}")
-    if "" in rules:
+            nonempty_columns = {column for column, value in data.items() if clean(value)}
+            input_nonempty_cells += len(nonempty_columns)
+            # Every non-empty column is represented once, except the three EAN
+            # helper columns which collectively produce one barcode node.
+            represented_cells += len(nonempty_columns - BARCODE_HEADERS)
+            if nonempty_columns & BARCODE_HEADERS:
+                represented_cells += 1
+
+    product_ids = [record.product_id for record in records]
+    duplicates = {
+        product_id: count
+        for product_id, count in Counter(product_ids).items()
+        if product_id and count > 1
+    }
+    if duplicates:
+        raise RuntimeError(f"Workbook contains duplicate product IDs: {duplicates}")
+    if any(not product_id for product_id in product_ids):
         raise RuntimeError("Workbook contains a blank product ID")
-    return rules, {
-        "source_rows": source_rows,
-        "source_unique_ids": len(rules),
+
+    return records, {
+        "source_rows": len(records),
+        "source_unique_ids": len(set(product_ids)),
+        "sheet_rows": dict(sheet_rows),
         "barcode_sources": dict(barcode_sources),
         "exclusion_reasons": dict(exclusion_reasons),
-        "excluded_products": sum(not rule.include for rule in rules.values()),
-        "expected_products": sum(rule.include for rule in rules.values()),
+        "excluded_products": sum(not record.include for record in records),
+        "expected_products": sum(record.include for record in records),
+        "input_nonempty_cells": input_nonempty_cells,
+        "represented_cells_after_ean_collapse": represented_cells,
     }
 
 
-def validate_xml_bytes(data: bytes) -> None:
-    parser = ET.XMLPullParser(events=("start", "end"))
-    for offset in range(0, len(data), 1024 * 1024):
-        parser.feed(data[offset : offset + 1024 * 1024])
-    parser.close()
+def write_element(
+    lines: list[str],
+    level: int,
+    tag: str,
+    value: Any,
+    *,
+    use_cdata: bool = False,
+) -> None:
+    body = cdata(value) if use_cdata else xml_escape(value)
+    lines.append(f"{'  ' * level}<{tag}>{body}</{tag}>")
 
 
-def valid_gtin(value: str) -> bool:
-    if not value.isdigit() or len(value) not in (8, 12, 13, 14):
-        return False
-    digits = [int(character) for character in value]
-    reversed_payload = digits[-2::-1]
-    weighted_sum = sum(
-        digit * (3 if index % 2 == 0 else 1)
-        for index, digit in enumerate(reversed_payload)
-    )
-    return (10 - weighted_sum % 10) % 10 == digits[-1]
-
-
-def transform_xml(
-    source_xml: Path,
-    output_xml: Path,
-    rules: dict[str, WorkbookRule],
+def build_xml(
+    workbook_path: Path,
+    output_path: Path,
     report_path: Path,
-    workbook_stats: dict[str, Any] | None = None,
+    delivery_text: str = DELIVERY_TEXT,
 ) -> dict[str, Any]:
-    source_bytes = source_xml.read_bytes()
-    validate_xml_bytes(source_bytes)
-    source_text = source_bytes.decode("utf-8")
-    output_parts: list[str] = []
-    cursor = 0
-    source_ids: list[str] = []
-    output_ids: list[str] = []
-    updated_barcodes = 0
-
-    for match in PRODUCT_BLOCK_RE.finditer(source_text):
-        output_parts.append(source_text[cursor : match.start()])
-        block = match.group(0)
-        id_match = ID_RE.search(block)
-        if id_match is None:
-            raise RuntimeError("A source XML product has no id element")
-        product_id = id_match.group("value").strip()
-        source_ids.append(product_id)
-        rule = rules.get(product_id)
-        if rule is None:
-            raise RuntimeError(f"XML product is absent from workbook: {product_id}")
-        if rule.include:
-            format_value = "EAN" if rule.barcode else ""
-            original_barcode = BARCODE_RE.search(block)
-            if original_barcode is None:
-                raise RuntimeError(f"Product has no barcode element: {product_id}")
-            if original_barcode.group("value").strip() != rule.barcode:
-                updated_barcodes += 1
-            block, format_count = BARCODE_FORMAT_RE.subn(
-                rf"\g<1>{format_value}\g<3>", block, count=1
-            )
-            block, barcode_count = BARCODE_RE.subn(
-                rf"\g<1>{rule.barcode}\g<3>", block, count=1
-            )
-            if format_count != 1 or barcode_count != 1:
-                raise RuntimeError(
-                    f"Product barcode structure is invalid: {product_id}"
-                )
-            output_parts.append(block)
-            output_ids.append(product_id)
-        cursor = match.end()
-    output_parts.append(source_text[cursor:])
-
-    if len(source_ids) != len(rules):
-        missing = sorted(set(rules) - set(source_ids))
-        raise RuntimeError(
-            f"Workbook/XML product count mismatch; {len(missing)} workbook IDs "
-            f"are absent from source XML"
-        )
-    candidate_bytes = "".join(output_parts).encode("utf-8")
-    validate_xml_bytes(candidate_bytes)
-    root = ET.fromstring(candidate_bytes)
-    products = root.findall("./products/product")
-    parsed_ids = [clean(product.findtext("id")) for product in products]
-    if parsed_ids != output_ids:
-        raise RuntimeError("Output product order or IDs changed unexpectedly")
-    duplicate_output_ids = {
-        product_id: count
-        for product_id, count in Counter(parsed_ids).items()
-        if count > 1
-    }
-    if duplicate_output_ids:
-        raise RuntimeError(f"Output has duplicate IDs: {duplicate_output_ids}")
-
-    barcode_mismatches: list[str] = []
-    output_barcodes: list[str] = []
-    for product in products:
-        product_id = clean(product.findtext("id"))
-        barcode = clean(product.findtext("barcode"))
-        output_barcodes.append(barcode)
-        if barcode != rules[product_id].barcode:
-            barcode_mismatches.append(product_id)
-    if barcode_mismatches:
-        raise RuntimeError(f"Barcode validation failed: {barcode_mismatches[:25]}")
-    blank_barcodes = sum(not barcode for barcode in output_barcodes)
+    records, workbook_stats = load_workbook_records(workbook_path)
+    included = [record for record in records if record.include]
     invalid_barcodes = [
-        barcode for barcode in output_barcodes if barcode and not valid_gtin(barcode)
+        record.barcode for record in included if not valid_gtin(record.barcode)
     ]
     duplicate_barcodes = {
         barcode: count
-        for barcode, count in Counter(output_barcodes).items()
-        if barcode and count > 1
+        for barcode, count in Counter(record.barcode for record in included).items()
+        if count > 1
     }
-    if blank_barcodes:
-        raise RuntimeError(f"Output has {blank_barcodes} blank barcodes")
     if invalid_barcodes:
-        raise RuntimeError(
-            f"Output has invalid GTIN values: {invalid_barcodes[:25]}"
-        )
+        raise RuntimeError(f"Invalid output GTIN values: {invalid_barcodes[:25]}")
     if duplicate_barcodes:
         raise RuntimeError(
-            f"Output has duplicate barcodes: {dict(list(duplicate_barcodes.items())[:25])}"
+            f"Duplicate output barcodes: {dict(list(duplicate_barcodes.items())[:25])}"
         )
 
-    output_xml.parent.mkdir(parents=True, exist_ok=True)
-    output_xml.write_bytes(candidate_bytes)
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>', "<root>", "  <products>"]
+    attribute_nodes = 0
+    attribute_source_columns: Counter[str] = Counter()
+
+    for record in included:
+        data = record.data
+        price = format_decimal(data.get("price_EUR_incl_vat"))
+        quantity = format_decimal(data.get("quantity"))
+        manufacturer = first_value(data, MANUFACTURER_HEADERS)
+        model = first_value(data, MODEL_HEADERS)
+        weight = format_decimal(data.get("weight_kg"))
+        parent_code = clean(data.get("parent_code"))
+
+        lines.append("    <product>")
+        write_element(lines, 3, "id", record.product_id)
+        lines.append("      <categories>")
+        write_element(lines, 4, "category", record.category, use_cdata=True)
+        lines.append("      </categories>")
+        write_element(lines, 3, "title", data.get("name_LT"), use_cdata=True)
+        write_element(lines, 3, "description", data.get("description_LT"), use_cdata=True)
+        write_element(lines, 3, "price", price)
+        write_element(lines, 3, "delivery_text", delivery_text)
+        lines.append("      <images>")
+        for image in record.images:
+            write_element(lines, 4, "image", image, use_cdata=True)
+        lines.append("      </images>")
+        write_element(lines, 3, "quantity", quantity)
+        write_element(lines, 3, "barcode_format", "EAN")
+        write_element(lines, 3, "barcode", record.barcode)
+
+        if model:
+            write_element(lines, 3, "model", model, use_cdata=True)
+        if weight:
+            write_element(lines, 3, "weight", weight)
+        write_element(lines, 3, "manufacturer", manufacturer, use_cdata=True)
+
+        lines.append("      <attributes>")
+        for source_column, title, value in record.attributes:
+            lines.append(
+                f'        <attribute title="{xml_escape(title)}">{cdata(value)}</attribute>'
+            )
+            attribute_nodes += 1
+            attribute_source_columns[source_column] += 1
+        lines.append("      </attributes>")
+
+        if parent_code:
+            write_element(lines, 3, "group", parent_code, use_cdata=True)
+        if clean(data.get("link")):
+            write_element(lines, 3, "url", data.get("link"), use_cdata=True)
+        write_element(lines, 3, "product_with_gift", "False")
+        write_element(lines, 3, "all_terminals_allowed", "true")
+        lines.append("    </product>")
+
+    lines.extend(["  </products>", "</root>", ""])
+    xml_bytes = "\n".join(lines).encode("utf-8")
+    ET.fromstring(xml_bytes)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(xml_bytes)
     report = {
-        "mode": "workbook_filtered_catalogue",
+        "mode": "complete_workbook_to_varle_xml",
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source_xml": str(source_xml),
-        "output_xml": str(output_xml),
-        "source_xml_products": len(source_ids),
-        "output_products": len(products),
-        "excluded_products": len(source_ids) - len(products),
-        "updated_barcodes": updated_barcodes,
-        "blank_output_barcodes": blank_barcodes,
-        "invalid_output_barcodes": len(invalid_barcodes),
-        "duplicate_output_barcodes": duplicate_barcodes,
-        "duplicate_output_ids": duplicate_output_ids,
-        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
-        "output_sha256": hashlib.sha256(candidate_bytes).hexdigest(),
-        "output_bytes": len(candidate_bytes),
-        "workbook": workbook_stats or {},
+        "workbook": str(workbook_path),
+        "output_xml": str(output_path),
+        "output_products": len(included),
+        "excluded_products": len(records) - len(included),
+        "attribute_nodes": attribute_nodes,
+        "attribute_source_columns": dict(attribute_source_columns),
+        "blank_output_barcodes": 0,
+        "invalid_output_barcodes": 0,
+        "duplicate_output_barcodes": {},
+        "ean_attribute_nodes": 0,
+        "output_sha256": hashlib.sha256(xml_bytes).hexdigest(),
+        "output_bytes": len(xml_bytes),
+        "workbook_stats": workbook_stats,
         "valid": True,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -279,19 +436,17 @@ def transform_xml(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workbook", required=True, type=Path)
-    parser.add_argument("--source-xml", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
+    parser.add_argument("--delivery-text", default=DELIVERY_TEXT)
     args = parser.parse_args()
-    rules, workbook_stats = load_workbook_rules(args.workbook.resolve())
-    report = transform_xml(
-        args.source_xml.resolve(),
+    report = build_xml(
+        args.workbook.resolve(),
         args.output.resolve(),
-        rules,
         args.report.resolve(),
-        workbook_stats,
+        args.delivery_text,
     )
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(report, ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate complete XLSX-to-VARLE XML field coverage and structure."""
+"""Validate XLSX core fields, attribute boundaries, and VARLE XML structure."""
 
 from __future__ import annotations
 

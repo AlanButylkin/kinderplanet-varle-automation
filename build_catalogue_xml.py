@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Build a complete VARLE Marketplace XML catalogue from the XLSX workbook.
-
-Every non-empty workbook value is represented in the XML:
+"""Build a VARLE Marketplace XML catalogue from the completed XLSX workbook.
 
 * VARLE-defined fields use their dedicated XML nodes.
-* Product parameters and remaining source fields use ``<attributes>``.
+* Marketplace attributes are the non-empty columns from ``color`` (included)
+  up to the first ``image_*`` column (excluded).
+* Legacy sheets without ``color`` retain only their ``attr_*`` fields.
 * ``ean`` is the preferred barcode; otherwise ``ean3`` is used.
 * ``ean2`` is research input only and is never exported.
 * ``ean``, ``ean2`` and ``ean3`` are never duplicated as attributes.
@@ -191,23 +191,34 @@ def attribute_title(column: str) -> str:
 
 
 def product_attributes(data: dict[str, Any]) -> tuple[tuple[str, str, str], ...]:
-    """Return (source column, VARLE title, value) for every remaining field."""
+    """Return the XLSX marketplace-attribute block in its original order.
+
+    Current catalogue sheets define the block positionally: it begins at
+    ``color`` and ends immediately before the first picture column.  ``Kita``
+    is a legacy-layout exception with no ``color`` header, so its historical
+    ``attr_*`` product fields are retained.
+    """
+    columns = list(data)
+    if "color" in data:
+        start = columns.index("color")
+        stop = next(
+            (
+                index
+                for index in range(start + 1, len(columns))
+                if IMAGE_HEADER_RE.fullmatch(columns[index])
+            ),
+            len(columns),
+        )
+        attribute_columns = columns[start:stop]
+    else:
+        attribute_columns = [column for column in columns if column.startswith("attr_")]
+
     attributes: list[tuple[str, str, str]] = []
-    for column, raw_value in data.items():
-        value = clean(raw_value)
+    for column in attribute_columns:
+        value = clean(data.get(column))
         if not value:
             continue
-        if column in CORE_HEADERS or IMAGE_HEADER_RE.fullmatch(column):
-            continue
         attributes.append((column, attribute_title(column), value))
-
-    # Manufacturer/brand/model are valid product parameters as well as useful
-    # top-level VARLE nodes, so keep their original workbook values here.
-    for column in (*MANUFACTURER_HEADERS, *MODEL_HEADERS):
-        value = clean(data.get(column))
-        candidate = (column, attribute_title(column), value)
-        if value and candidate not in attributes:
-            attributes.append(candidate)
     return tuple(attributes)
 
 
@@ -221,7 +232,7 @@ def load_workbook_records(path: Path) -> tuple[list[ProductRecord], dict[str, An
     barcode_sources: Counter[str] = Counter()
     exclusion_reasons: Counter[str] = Counter()
     input_nonempty_cells = 0
-    represented_cells = 0
+    exported_attribute_cells = 0
 
     for worksheet in workbook.worksheets:
         if worksheet.title == "xml":
@@ -282,13 +293,8 @@ def load_workbook_records(path: Path) -> tuple[list[ProductRecord], dict[str, An
             barcode_sources[barcode_source] += 1
             exclusion_reasons.update(reasons)
 
-            nonempty_columns = {column for column, value in data.items() if clean(value)}
-            input_nonempty_cells += len(nonempty_columns)
-            # Every non-empty column is represented once, except the three EAN
-            # helper columns which collectively produce one barcode node.
-            represented_cells += len(nonempty_columns - BARCODE_HEADERS)
-            if nonempty_columns & BARCODE_HEADERS:
-                represented_cells += 1
+            input_nonempty_cells += sum(bool(clean(value)) for value in data.values())
+            exported_attribute_cells += len(attributes)
 
     product_ids = [record.product_id for record in records]
     duplicates = {
@@ -310,7 +316,7 @@ def load_workbook_records(path: Path) -> tuple[list[ProductRecord], dict[str, An
         "excluded_products": sum(not record.include for record in records),
         "expected_products": sum(record.include for record in records),
         "input_nonempty_cells": input_nonempty_cells,
-        "represented_cells_after_ean_collapse": represented_cells,
+        "exported_attribute_cells": exported_attribute_cells,
     }
 
 

@@ -9,12 +9,14 @@
 [![Update Varle XML](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml/badge.svg)](https://github.com/AlanButylkin/kinderplanet-varle-automation/actions/workflows/sync.yml)
 
 The static catalogue baseline in `catalogue/varle.xml` is generated from the
-completed XLSX workbook. Every non-empty workbook field is represented in the
-XML: Varle-defined fields use their dedicated nodes and all remaining fields
-are emitted as product attributes. The only source columns intentionally not
-exported as attributes are `ean`, `ean2`, and `ean3`: `ean` is used as the
-barcode when present, otherwise `ean3` is used, while `ean2` is never
-published.
+completed XLSX workbook. Varle-defined fields use their dedicated nodes.
+Marketplace attributes follow the workbook's defined positional block: from
+`color` (included) through the column immediately before `image_1`. Pictures
+and trailing operational columns such as image count, weight, dimensions, and
+parent code are not emitted as attributes. On the legacy `Kita` sheet, which
+has no `color` column, only its historical `attr_*` fields are retained.
+`ean` is used as the barcode when present, otherwise `ean3` is used; `ean2` is
+never published.
 
 Every 30 minutes the workflow starts from that complete baseline and changes
 only validated `price` and `quantity` values from the KinderPlanet Verskis full
@@ -50,7 +52,8 @@ Monthly releases are excluded from the eight-version feed cleanup.
 
 ## Safety behaviour
 
-- The complete XLSX-to-XML export is checked field by field before publication.
+- The XLSX-to-XML core fields and defined marketplace-attribute block are
+  checked field by field before publication.
 - Rows with a blank title, description, price, quantity, category, barcode, or
   without an image are excluded because Varle requires those fields.
 - Barcodes must be valid, unique GTIN values.
